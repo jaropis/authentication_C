@@ -1,0 +1,261 @@
+# Week 1: TCP and the smallest HTTP server
+
+## Goal
+
+Build a single-process C server that listens only on `127.0.0.1:8080`, accepts one connection at a time, reads request bytes, and always returns a fixed valid HTTP response.
+
+Time budget: 5-8 hours.
+
+## Start here
+
+Begin with an empty implementation. From the repository root, create the working directories:
+
+```bash
+mkdir -p week-01/src week-01/notes
+```
+
+Before writing code, confirm the local tools:
+
+```bash
+cc --version
+curl --version
+nc -h
+```
+
+Use `clang` or `gcc` through the generic `cc` command. Keep the server local for the entire course; do not bind to `0.0.0.0` or expose port 8080 to the Internet.
+
+Your starting state is:
+
+```text
+week-01/
+├── README.md
+├── Makefile          # you will create this
+├── notes/
+│   └── observations.md
+└── src/
+    └── main.c
+```
+
+Nothing needs to compile yet.
+
+## Concepts to learn first
+
+Be able to describe these in one sentence each before implementing them:
+
+- An IP address identifies a network interface; `127.0.0.1` is the IPv4 loopback address.
+- A TCP port identifies a listening service on a host.
+- A socket is an operating-system-managed endpoint represented in C by a file descriptor.
+- TCP provides an ordered byte stream, not HTTP messages.
+- The server learns where one HTTP request ends by interpreting bytes according to HTTP rules. This week, it does not interpret them yet.
+
+Draw this lifecycle in `notes/observations.md` and annotate what each call returns:
+
+```text
+socket -> bind -> listen -> accept -> recv -> send -> close
+```
+
+## Milestone 1: Create a strict build
+
+Create a `Makefile` with these targets:
+
+- `all` builds `authlab` from `src/main.c`.
+- `run` depends on `authlab` and runs it.
+- `clean` removes `authlab`.
+
+Compile as C11 with debug symbols and warnings treated as errors:
+
+```text
+-std=c11 -g -Wall -Wextra -Wpedantic -Werror
+```
+
+Run:
+
+```bash
+cd week-01
+make
+```
+
+At this checkpoint, a minimal `main` may simply return `0`. Fix every warning rather than weakening the flags.
+
+## Milestone 2: Open and bind the listening socket
+
+In `src/main.c`:
+
+1. Call `socket(AF_INET, SOCK_STREAM, 0)`.
+2. Check for `-1`; on failure, print the system error with `perror` and exit nonzero.
+3. Enable `SO_REUSEADDR` with `setsockopt`. This makes quick stop/start cycles less frustrating.
+4. Initialize a `struct sockaddr_in` to zero.
+5. Set its family to `AF_INET`.
+6. convert port `8080` with `htons`.
+7. Convert the literal address `127.0.0.1` using `inet_pton`; do not use `INADDR_ANY`.
+8. Call `bind`, then `listen` with a small positive backlog such as `16`.
+9. Print `Listening on http://127.0.0.1:8080` only after both calls succeed.
+
+Store the port and response as named constants rather than scattering literals through `main`.
+
+Compile and run:
+
+```bash
+make
+./authlab
+```
+
+In a second terminal, confirm that the process owns only the loopback listener:
+
+```bash
+lsof -nP -iTCP:8080 -sTCP:LISTEN
+```
+
+The address should be `127.0.0.1:8080`, not `*:8080`.
+
+## Milestone 3: Accept and inspect bytes
+
+Add an infinite server loop. For each iteration:
+
+1. Call `accept` and check the returned client file descriptor.
+2. Read up to a fixed limit, such as 4096 bytes, with `recv`.
+3. Treat the return value as the number of valid bytes. A receive buffer is not automatically a C string.
+4. Print the bytes with `fwrite(buffer, 1, bytes_received, stdout)` rather than `%s`.
+5. Close the client socket before accepting the next connection.
+
+Handle a negative `recv` result as an error. A zero result means that the peer closed its sending side.
+
+Restart the server and connect from another terminal:
+
+```bash
+nc 127.0.0.1 8080
+```
+
+Type the following, then press Enter twice:
+
+```http
+GET / HTTP/1.1
+Host: localhost
+
+```
+
+The server terminal should show the request bytes. `nc` will not receive a useful response yet.
+
+## Milestone 4: Send a valid fixed response
+
+Use this exact logical response, encoded with HTTP carriage-return/line-feed separators (`\r\n`):
+
+```http
+HTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Length: 13
+Connection: close
+
+Hello, world!
+```
+
+In the C string, the blank line between headers and body is `\r\n\r\n`. Compute the byte count from the array, for example with `sizeof response - 1`; do not send the terminating NUL byte.
+
+Create a small `send_all` helper that keeps calling `send` until every response byte has been written. Account for these cases:
+
+- A positive result may be smaller than the requested length.
+- `-1` with `errno == EINTR` should retry.
+- Any other nonpositive result should fail the operation.
+
+After sending, close the client socket and return to `accept`.
+
+## Protocol inspection
+
+Run the server in one terminal:
+
+```bash
+cd week-01
+./authlab
+```
+
+Run each experiment in another terminal and record the observed request and response in `notes/observations.md`.
+
+### Experiment A: curl
+
+```bash
+curl -v http://127.0.0.1:8080/
+```
+
+Identify:
+
+- the TCP destination;
+- the request line generated by curl;
+- the `Host` header;
+- the response status line;
+- the header/body boundary;
+- why curl accepts exactly 13 body bytes.
+
+### Experiment B: manual HTTP
+
+```bash
+printf 'GET /anything HTTP/1.1\r\nHost: localhost\r\n\r\n' | nc 127.0.0.1 8080
+```
+
+The response should be identical because the server does not parse the path yet.
+
+### Experiment C: non-HTTP bytes
+
+```bash
+printf 'this is not HTTP\n' | nc 127.0.0.1 8080
+```
+
+The server should still return `200 OK`. Explain why this behavior is expected now and unacceptable after request parsing is introduced in Week 2.
+
+## Failure exercises
+
+Perform each failure deliberately, then restore the working state:
+
+1. Start a second copy of the server. Observe the `bind` failure and its system error.
+2. Temporarily change `Content-Length` to `12`. Observe how curl handles a body longer than the declared length.
+3. Temporarily change it to `14`. Observe curl reporting a truncated transfer after the connection closes.
+4. Stop the server and run curl again. Distinguish “connection refused” from an HTTP error response.
+
+Do not leave any deliberate breakage in the final implementation.
+
+## Optional sanitizer pass
+
+Rebuild with AddressSanitizer and UndefinedBehaviorSanitizer:
+
+```bash
+make clean
+make CFLAGS='-std=c11 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=address,undefined'
+./authlab
+```
+
+Repeat the curl and `nc` experiments. Stop the server with Ctrl+C.
+
+## End-of-week working state
+
+At the end of Week 1, you should have a warning-free `week-01/authlab` that:
+
+- binds only to `127.0.0.1:8080`;
+- accepts sequential TCP connections;
+- reads and safely prints a bounded amount of request data;
+- sends a complete, correctly framed fixed HTTP response;
+- closes each client connection without terminating the server;
+- reports system-call failures rather than continuing with invalid descriptors.
+
+Verify from the repository root:
+
+```bash
+make -C week-01 clean all
+week-01/authlab & server_pid=$!
+curl --retry 20 --retry-connrefused --retry-delay 0 --retry-max-time 5 --silent --output /dev/null http://127.0.0.1:8080/
+curl --fail-with-body --silent http://127.0.0.1:8080/
+kill "$server_pid"
+```
+
+The output must be exactly:
+
+```text
+Hello, world!
+```
+
+Your `notes/observations.md` should answer:
+
+1. Which bytes belong to TCP, and which interpretation belongs to HTTP?
+2. Why can one `send` call be insufficient even for a small response?
+3. Why is it unsafe to print a `recv` buffer with `%s` without adding and accounting for a terminator?
+4. What does the operating system do between `listen` and `accept`?
+
+This complete directory is the implementation baseline you will copy into `week-02`.
